@@ -1,0 +1,21 @@
+[package]
+name = "nginx_upstream_configure"
+version = "0.1.0"
+authors = ["mitsuru@procube.jp"]
+edition = "2021"
+
+[[bin]]
+name = "nginx_upstream_configure"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.95"
+chrono = "0.4.39"
+env_logger = "0.11.6"
+futures = "0.3.31"
+log = "0.4.22"
+nix = { version = "0.29.0", features = ["signal"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_yaml = "0.9.34"
+tokio = { version = "1.43.0", features = ["full"] }
+trust-dns-resolver = "0.23.2"
