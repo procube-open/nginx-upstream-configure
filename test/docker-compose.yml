@@ -6,8 +6,8 @@ services:
       - UPSCONF_LOG_LEVEL=debug
     volumes:
       - ../target/debug/nginx_upstream_configure:/usr/sbin/nginx_upstream_configure
-      - ./upstreams.d:/etc/nginx/upstreams.d
-      - ./default.conf:/etc/nginx/conf.d/default.conf
+      - ./var/upstreams.d:/etc/nginx/upstreams.d
+      - ./var/conf.d:/etc/nginx/conf.d
     entrypoint: ["/usr/sbin/nginx_upstream_configure"]
     networks:
       my_network:
@@ -20,7 +20,7 @@ services:
     container_name: coredns
     volumes:
       - ./Corefile:/etc/coredns/Corefile
-      - ./db.example.com:/etc/coredns/db.example.com
+      - ./var/db.example.com:/etc/coredns/db.example.com
     command: -conf /etc/coredns/Corefile
     networks:
       my_network:
@@ -31,8 +31,7 @@ services:
     container_name: app1
     volumes:
       - ./app_default.conf:/etc/nginx/conf.d/default.conf
-      - ./app1/index.txt:/usr/share/nginx/html/index.txt
-    entrypoint: ["/usr/sbin/nginx"]
+      - ./app1:/usr/share/nginx/html
     networks:
       my_network:
         ipv4_address: 172.20.0.6
@@ -42,8 +41,7 @@ services:
     container_name: app2
     volumes:
       - ./app_default.conf:/etc/nginx/conf.d/default.conf
-      - ./app2/index.txt:/usr/share/nginx/html/index.txt
-    entrypoint: ["/usr/sbin/nginx"]
+      - ./app2:/usr/share/nginx/html
     networks:
       my_network:
         ipv4_address: 172.20.0.7
@@ -53,8 +51,7 @@ services:
     container_name: app3
     volumes:
       - ./app_default.conf:/etc/nginx/conf.d/default.conf
-      - ./app3/index.txt:/usr/share/nginx/html/index.txt
-    entrypoint: ["/usr/sbin/nginx"]
+      - ./app3:/usr/share/nginx/html
     networks:
       my_network:
         ipv4_address: 172.20.0.8

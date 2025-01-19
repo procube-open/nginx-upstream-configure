@@ -20,7 +20,7 @@ use regex::Regex;
 use futures::future::try_join_all;
 use trust_dns_resolver::TokioAsyncResolver;
 use env_logger::Builder as LoggerBuilder;
-
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +39,7 @@ fn default_maxips() -> usize {
 #[derive(Debug, Clone)]
 struct IpEntry {
     ip: IpAddr,
-    registered_at: Instant,
+    registered_at: DateTime<Utc>,
 }
 
 fn get_env_var(key: &str, default: &str, pattern: &str) -> Result<String> {
@@ -51,30 +51,31 @@ fn get_env_var(key: &str, default: &str, pattern: &str) -> Result<String> {
     Ok(value)
 }
 
-fn get_env_var_as_u32(key: &str, default: &str, pattern: &str) -> Result<u32> {
+fn get_env_var_as_u64(key: &str, default: &str, pattern: &str) -> Result<u64> {
     let value_str = get_env_var(key, default, pattern)?;
-    value_str.parse::<u32>().context(format!("Cannot convert value '{}' of environment variable {} to a number", value_str, key))
+    value_str.parse::<u64>().context(format!("Cannot convert value '{}' of environment variable {} to a number", value_str, key))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 環境変数から設定を読み込む
+    // Config options from environment variables
     let upstreams_dir = get_env_var("UPSCONF_UPSTREAMS_DIR", "/etc/nginx/upstreams.d", r"^/[\w/.]+$")?;
-    let nginx_conf_dir = get_env_var("UPSCONF_NGINX_CONF_DIR", "/etc/nginx/conf.d", r"^/[\w/.]+$")?;
-    let minttl_on_fail = get_env_var_as_u32("UPSCONF_MINTTL_ON_FAIL", "30", r"^[\d]+$")?;
-    let nginx_stable_millis = get_env_var_as_u32("UPSCONF_NGINX_STABLE_MILLIS", "1000", r"^[\d]+$")?;
+    let nginx_conf_dir_str = get_env_var("UPSCONF_NGINX_CONF_DIR", "/etc/nginx/conf.d", r"^/[\w/.]+$")?;
+    let nginx_conf_dir_str = Box::leak(Box::new(nginx_conf_dir_str));
+    let nginx_conf_dir = Path::new(nginx_conf_dir_str);
+    let ttl_on_fail = get_env_var_as_u64("UPSCONF_TTL_ON_FAIL", "30", r"^[\d]+$")?;
+    let nginx_stable_millis = get_env_var_as_u64("UPSCONF_NGINX_STABLE_MILLIS", "1000", r"^[\d]+$")?;
     let nginx_conf = get_env_var("UPSCONF_NGINX_CONF", "/etc/nginx/nginx.conf", r"^/[\w/.]+\.conf$")?;
     let empty_server_conf = get_env_var("UPSCONF_EMPTY_SERVER_CONF", "127.0.0.1:10080", r"^[\d:.]+$")?;
 
-    // ロガーの初期化
-    // LoggerBuilder::from_env("UPSCONF_LOG_LEVEL").init();
+    // Initialize logger
     let log_level = env::var("UPSCONF_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     LoggerBuilder::new()
         .filter_level(LevelFilter::Info)
         .parse_filters(&log_level)
         .init();
 
-    // /etc/nginx/upstreams.d の下の設定ファイルを読み込む
+    // read upstream config files
     let mut upstream_configs = HashMap::new();
     for entry in fs::read_dir(upstreams_dir)? {
         let entry = entry?;
@@ -90,93 +91,100 @@ async fn main() -> Result<()> {
         }
     }
 
-    // upstream ごとの IP アドレステーブルを初期化
+    // initialize ip_table for each upstream
     let ip_tables: Arc<Mutex<HashMap<String, Vec<IpEntry>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // 初期 upstream コンフィグファイルを生成
+    // generate empty upstream configuration
     for (upstream_name, _) in upstream_configs.clone() {
-        create_upstream_config(&upstream_name, &[], None, 0, empty_server_conf.clone(), Path::new(&nginx_conf_dir))?;
+        create_upstream_config(&upstream_name, &[], None, 0, empty_server_conf.clone(), nginx_conf_dir)?;
     }
 
-    // nginx を起動
+    // start nginx and ensure it is running
     let mut nginx_process = start_nginx(nginx_conf)?;
     let nginx_pid = Pid::from_raw(nginx_process.id().unwrap() as i32);
+    tokio::time::sleep(Duration::from_millis(nginx_stable_millis)).await;
+    if let Some(status) = nginx_process.try_wait()? {
+        return Err(anyhow!("nginx process exited immediately after starting: {:?}", status));
+    }
 
-     // 1秒待ってから nginx プロセスがまだ生きていることを確認
-     tokio::time::sleep(Duration::from_millis(nginx_stable_millis as u64)).await;
-     if let Some(status) = nginx_process.try_wait()? {
-         return Err(anyhow!("nginx process exited immediately after starting: {:?}", status));
-     }
-
-    // シグナルハンドラーの設定
+    // Configure signal handler for graceful shutdown
     let shutdown_signal = Arc::new(Mutex::new(false));
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigquit = signal(SignalKind::quit())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    // 設定ファイルごとに処理を並列に実行
+    // Execute processing in parallel for each upstream configuration file
     let handles: Arc<Mutex<Vec<JoinHandle<Result<()>>>>> = Arc::new(Mutex::new(Vec::new()));
     for (upstream_name, config) in upstream_configs.clone() {
         let shutdown_signal = shutdown_signal.clone();
         ip_tables.lock().unwrap().insert(config.name.clone(), Vec::new());
         let ip_tables = ip_tables.clone();
-        let nginx_conf_dir = nginx_conf_dir.clone();
         let empty_server_conf = empty_server_conf.clone();
         let handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-            debug!(
+            info!(
                 "spawn DNS Query thread fqdn={} for upstream '{}'",
                 config.fqdn,
                 upstream_name
             ); 
-            // DNS Resolver の設定
+            // Configure DNS Resolver according to the contents of /etc/resolv.conf
             let resolver = TokioAsyncResolver::tokio_from_system_conf()?;
-            let mut last_valid_until: Option<Instant>  = None;
+            let mut ttl = Duration::from_secs(ttl_on_fail);
             loop {
-                // DNS で FQDN を問い合わせ
+                // Query the fqdn and update the upstream configuration file
                 let mut ip_addresses = Vec::new();
-                let mut min_ttl = minttl_on_fail;
                 let empty_server_conf = empty_server_conf.clone();
                 match resolver.lookup_ip(&config.fqdn).await {
                     Ok(response) => {
-                        if last_valid_until.is_some() {
-                            min_ttl = response.valid_until().duration_since(last_valid_until.unwrap()).as_secs() as u32;
-                            debug!("update min_ttl: {}", min_ttl);
+                        // The resolver itself has a caching function, so if you make a query without reaching the previous valid_until time,
+                        // the cached result will be returned and the valid_until value will remain old. 
+                        // In order to exceed valid_until with sleep,
+                        // it seems that we can pass it to sleep as is as a Duration type without using as_secs etc.
+                        let now = Instant::now();
+                        let valid_until = response.valid_until();
+                        if let Some(ttl_duration) = valid_until.checked_duration_since(now) {
+                            ttl = ttl_duration;
+                            debug!("query suceeded ttl={}mills", ttl.as_millis());
+                        } else {
+                            warn!("query suceeded, but valid_until is in the past, use priviues ttl={}millis", ttl.as_millis());
                         }
-                        last_valid_until = Some(response.valid_until());
                         for record in response.iter() {
                             ip_addresses.push(record);
                         }
                         let mut my_ip_tables = ip_tables.lock().unwrap();
                         if let Some(ip_table) = my_ip_tables.get_mut(&upstream_name) {
+                            debug!(
+                                "Find out if we need to update upstream settings: ips={}", 
+                                ip_addresses.iter().map(|ip| ip.to_string()).collect::<Vec<String>>().join(", "));
                             if update_ip_table(&ip_addresses, ip_table) {
                                 info!(
-                                    "update upstream config: {}",
-                                    ip_addresses
+                                    "There was a change in the upstream server addresses: ips={} ttl={}millis",
+                                    ip_table
                                         .iter()
-                                        .map(|ip| ip.to_string())
+                                        .map(|entry| format!("ip={} registeredAt={}", entry.ip, entry.registered_at.to_rfc3339()))
                                         .collect::<Vec<String>>()
-                                        .join(", ")
+                                        .join(", "),
+                                    ttl.as_millis()
                                 );
-                                // upstream コンフィグファイルを更新
                                 create_upstream_config(
                                     &upstream_name,
                                     ip_table,
                                     config.port,
                                     config.maxips,
                                     empty_server_conf,
-                                    Path::new(&nginx_conf_dir),
+                                    nginx_conf_dir,
                                 )?;
-                                // nginx をリロード
                                 reload_nginx(nginx_pid)?;
+                            } else {
+                                debug!("No change in the upstream server addresses");
                             }
                         }
                     }
                     Err(e) => {
                         error!(
-                            "fail to DNS Query fqdn={} for upstream {}: {}",
+                            "fail to DNS Query fqdn={} for upstream {}, so clear ip table and configure upstream to return errors : {}",
                             config.fqdn, upstream_name, e
                         );
-                        // DNS 問い合わせに失敗した場合は IP アドレステーブルを空にする
+                        ttl = Duration::from_secs(ttl_on_fail);
                         let mut my_ip_tables = ip_tables.lock().unwrap();
                         let ip_table = my_ip_tables.get_mut(&upstream_name).unwrap();
                         ip_table.clear();
@@ -186,15 +194,16 @@ async fn main() -> Result<()> {
                             None,
                             config.maxips,
                             empty_server_conf,
-                            Path::new("/etc/nginx/conf.d"),
+                            nginx_conf_dir
                         )?;
+                        reload_nginx(nginx_pid)?;
                     }
                 }
 
-                // DNS の TTL が切れるかシャットダウンシグナルを受信するまで sleep
+                // sleep until the IP address's TTL expires or a shutdown signal is received
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(min_ttl as u64)) => {
-                        debug!("wake up from {} seconds sleeping", min_ttl);
+                    _ = tokio::time::sleep(ttl) => {
+                        debug!("wake up from {} milli seconds sleeping", ttl.as_millis());
                     },
                     true = async {
                         *shutdown_signal.lock().unwrap()
@@ -209,8 +218,8 @@ async fn main() -> Result<()> {
     }
 
     info!("upstream configuration threads are started");
-
-    // すべてのタスクを並行して実行し、どれかが終了したら shutdown_signal を true にする
+    // Wait until one of the upstream configuration tasks finishes,
+    // the nginx process exits, or a shutdown signal is received
     let mut exit_code = 0;
     tokio::select! {
         result = try_join_all(handles.lock().unwrap().drain(..)) => {
@@ -240,20 +249,20 @@ async fn main() -> Result<()> {
             *shutdown_signal.lock().unwrap() = true;
         },
         _ = sigint.recv() => {
-            warn!("A SIGINT was received. Exit the program...");
+            warn!("A SIGINT was received. Exit the program...waiting for all threads and nginx to terminate");
             *shutdown_signal.lock().unwrap() = true;
         },
         _ = sigquit.recv() => {
-            info!("A SIGQUIT was received. Exit the program...");
+            info!("A SIGQUIT was received. Exit the program...waiting for all threads and nginx to terminate");
             *shutdown_signal.lock().unwrap() = true;
         },
         _ = sigterm.recv() => {
-            warn!("A SIGTERM was received. Exit the program...");
-            *shutdown_signal.lock().unwrap() = true;
+            warn!("A SIGTERM was received. Exit immediately");
+            std::process::exit(1);
         }
     }
 
-    // 全ての upstream 設定スレッドが完了するのを待つ
+    // Wait for all upstream configuration tasks to complete
     let handles: Vec<_> = handles.lock().unwrap().drain(..).collect();
     for handle in handles {
         if let Err(e) = handle.await {
@@ -266,34 +275,36 @@ async fn main() -> Result<()> {
         error!("fail to shutdown ngins: {}", e);
         std::process::exit(1);
     }
-    // nginx プロセスの監視タスクが完了するのを待つ
-    info!("waiting for nginx process to terminate...");
+    // Wait for nginx process monitoring task to complete
     nginx_process.wait().await?;
+    info!("nginx process is terminated");
 
     std::process::exit(exit_code);
 }
 
 fn update_ip_table(ip_addresses: &[IpAddr], ip_table: &mut Vec<IpEntry>) -> bool {
-    let now = Instant::now();
     let mut changed = false;
     // ip_table に新しい IP アドレスを追加
     for ip in ip_addresses.iter() {
         if ip_table.iter().all(|entry| entry.ip != *ip) {
-            debug!("add new IP address: {}", ip);
+            info!("add new IP address: {}", ip);
             ip_table.push(IpEntry {
                 ip: *ip,
-                registered_at: now,
+                registered_at: Utc::now(),
             });
             changed = true;
         }
     }
-    // ip_table から ip_addresses に含まれない IP アドレスを削除
-    let original_len = ip_table.len();
-    ip_table.retain(|entry| ip_addresses.iter().any(|e| e == &entry.ip));
-    if ip_table.len() != original_len {
-        debug!("remove IP addresses: {}", original_len - ip_table.len());
-        changed = true;
-    }
+    // Remove IP addresses not included in ip_addresses from ip_table
+    ip_table.retain(|entry| {
+        if ip_addresses.iter().all(|e| e != &entry.ip) {
+            info!("remove IP address: {}", entry.ip);
+            changed = true;
+            false
+        } else {
+            true
+        }
+    });
     changed
 }
 
@@ -304,7 +315,7 @@ fn start_nginx(nginx_conf: String) -> Result<Child> {
         .arg("-g")
         .arg("daemon off;")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to start nginx")
 }

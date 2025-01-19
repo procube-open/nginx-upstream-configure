@@ -1,18 +1,28 @@
 # nginx-upstream-configure
 
-このプログラムは、指定されたFQDNのIPアドレスをDNSで定期的に問い合わせ、nginxのupstream設定を動的に更新します。
+This program periodically queries DNS for the IP address of the specified FQDN and dynamically updates nginx's upstream settings.
 
-## 動作の流れ
+## Upstream definition file
 
-1. /etc/nginx/upstreams.d の下の設定ファイル（形式はYAMLで拡張子は .yml） を全て読み込み設定ファイルごとに以下の2.以降をの初期化処理を実行する。ただし、設定ファイルの name 要素が複数のファイルの間で重複している場合はエラーとする。以降、設定ファイルの name 要素の値を upstream 名とする。
-2. upstream ごとの IP アドレステーブルを空で初期化する。
-3. "upstream upstream名 {server 127.0.0.1:10080}" という内容で /etc/nginx/conf.d/upstream名.conf という名前で upstream コンフィグファイルを生成する。
-4. すべての upstream の初期化処理が終わったら nginx を起動し、そのプロセスIDを記憶する。起動したプロセスを監視し、プロセスが異常終了した場合は、再起動する。異常終了を5回異常繰り返した場合は、このプログラム自身もエラーで終了する。
-5. 設定ファイルごとに以下の6以降の処理を並列に実行する。
-6. 設定ファイルの fqdn 要素に指定されている FQDN をDNSで問い合わせてそのIPアドレスが IP アドレステーブルに登録されていない場合は、登録し現在時刻を登録時刻として設定する.また、IPアドレステーブルに余分なものがあれば削除する。DNS 問い合わせに失敗した場合はIPアドレステーブルを空にする。
-7. 前項 6. の処理でIPアドレステーブルに変化がなかった場合は、10 までスキップし、変化があった場合は以下の 8. 9. を実行する。このとき、他の設定ファイルと処理が競合しないようにロックを取得する。
-8. /etc/nginx/conf.d/upstream名.conf という名前で upstream コンフィグファイルを出力する。このコンフィグファイルには upstream 名の upstream ディレクティブが1個を出力する。upstream の中に設定ファイルの maxips 要素に指定された個数（デフォルトは1）の server ディレクティブを出力する。このとき、IP アドレステーブルから登録日時が新しいものから順に出力し、余ったものは出力しない。 また、設定ファイルに port 要素が指定されている場合はそのポート番号を server ディレクティブに追加する。IPアドレステーブルが空の場合は"upstream upstream名 {server 127.0.0.1:10080}" という内容で出力する。
-9. 接続可能になったら nginx プロセスに SIGHUP　シグナルを送信し nginx をリロードする。
-10. DNSのTTL（複数IPの場合は最小の値）が切れるまで sleep する
-11. 問い合わせの結果が変化していた場合、6. に戻ってループする。
-シャットダウンシグナルを受信すると nginx プロセスに SIGQUIT　シグナルを送信し nginx をシャットダウンし、プログラムを終了する。
+Upstream definition file is a configuraion for upstream directive on nginx.The format is yaml include following element.
+
+|element|description|
+|--|--|
+|name|The name of upstream to be referenced by proxy_pass directive in location defined in other configuration file.|
+|fqdn|The fqdn of upstream web server.|
+|port|The port number of upstream web server. This can be omitted. If ommited, the server directive generated with no port number.|
+|maxips|The number of server directive for each ip address returned by DNS.If DNS returns more IP addresses than the number specified here, server directives will be generated in order from the newest one, and the remaining ones will be discarded. Default is 1.| 
+## Procedure
+
+1. Read all configuration files (in YAML format with a .yml extension) under /etc/nginx/upstreams.d and execute the initialization process described in steps 2 and beyond for each configuration file. If the name element in the configuration file is duplicated across multiple files, an error will occur. Hereafter, the value of the name element in the configuration file will be referred to as the upstream name.
+2. Initialize an empty IP address table for each upstream.
+3. Generate an upstream configuration file named /etc/nginx/conf.d/upstream_name.conf with the content "upstream upstream_name {server 127.0.0.1:10080}".This cause 502 error when access the application via http.
+4. After completing the initialization process for all upstreams, start nginx and remember its process ID. Monitor the started process, and If the process ends within 1 second, the program will end with an error.
+5. Execute the following steps 6 and beyond in parallel for each configuration file.
+6. Query the FQDN specified in the fqdn element of the configuration file via DNS. If the retuned IP address is not registered in the previous IP address table, register it and set the current time as the registration time. Also, remove any unnecessary entries from the IP address table. If the DNS query fails, clear the IP address table.
+7. If there is no change in the IP address table maintained as step 6, skip to step 10. If there is a change, execute steps 8 and 9. At this time, acquire a lock to prevent conflicts with other configuration thread.
+8. Output the upstream configuration file named /etc/nginx/conf.d/upstream_name.conf. This configuration file should contain a single upstream directive with the upstream name. Inside the upstream directive, output the number of server directives specified by the maxips element in the configuration file (default is 1). Output the server directives in order of the most recently registered IP addresses from the IP address table, and do not output any excess entries. If the port element is specified in the configuration file, add the port number to the server directive. If the IP address table is empty, output "upstream upstream_name {server 127.0.0.1:10080}".
+9. And then send a SIGHUP signal to the nginx process to gracefully reload nginx.
+10. Sleep until the DNS TTL expires.
+11. Return to step 6 and repeat the loop.
+When a shutdown signal is received, stop all configuration threds  and send a SIGQUIT signal to the nginx process to shut down nginx and terminate the program.
